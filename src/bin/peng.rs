@@ -27,6 +27,7 @@ impl eframe::App for Wrap {
             match action {
                 platform::tray::TrayAction::Open => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 platform::tray::TrayAction::Refresh => self.app.trigger_refresh(),
@@ -40,6 +41,18 @@ impl eframe::App for Wrap {
                 }
             }
         }
+        // Stashed tray actions from the watcher thread (menu used while the
+        // viewport was hidden and `ui()` wasn't running to poll it).
+        if platform::paths::tray_refresh_file().exists() {
+            let _ = std::fs::remove_file(platform::paths::tray_refresh_file());
+            self.app.trigger_refresh();
+        }
+        if platform::paths::tray_next_file().exists() {
+            let _ = std::fs::remove_file(platform::paths::tray_next_file());
+            if let Some(url) = self.app.dash.next_up_url.clone() {
+                platform::open_url(&url);
+            }
+        }
 
         if self.hide_pending {
             self.hide_pending = false;
@@ -50,6 +63,24 @@ impl eframe::App for Wrap {
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
+        // Restore requests win over the hide above when both land same frame.
+        // Sources: tray left-click, or a second launch (shortcut / taskbar
+        // pin) touching the show-request sentinel while this process holds
+        // app.lock. Checked here as well as on the watcher thread so a
+        // restore works even if one path stalls.
+        #[cfg(feature = "tray")]
+        if platform::tray::try_show_requested() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if platform::paths::show_request_file().exists() {
+            let _ = std::fs::remove_file(platform::paths::show_request_file());
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
         self.app.draw(ui);
@@ -110,6 +141,24 @@ fn main() {
         use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwareness, PROCESS_DPI_UNAWARE};
         let _ = SetProcessDpiAwareness(PROCESS_DPI_UNAWARE);
     }
+    // Second launch fast-path: if another instance already holds app.lock,
+    // signal it to restore its window instead of spawning a useless GPU
+    // probe child. Runs before the stage probe so relaunching a hidden app
+    // (shortcut / taskbar pin) feels instant.
+    {
+        let dir = platform::paths::ensure_data_dir();
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(dir.join("app.lock"))
+        {
+            if f.try_lock().is_err() {
+                let _ = std::fs::write(dir.join("show-request"), b"show");
+                launch_log("second launch: signaled running instance");
+                return;
+            }
+        }
+    }
     // Renderer strategy: hardware GPU first, WARP (Microsoft Basic Render Drive)
     // as automatic fallback. Some Intel iGPU drivers crash or present blank
     // through both GL and DX12; WARP is rock-solid and peng's UI is tiny.
@@ -165,16 +214,24 @@ fn main() {
 
     // Single instance: only the final UI process takes this lock. The
     // GPU stage-probe parent exits before reaching it; a second launch of
-    // the app finds the lock held and exits immediately.
+    // the app signals the running instance (see fast-path above) and exits.
     let instance_lock = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .open(dir.join("app.lock"))
         .expect("open single-instance lock file");
     if instance_lock.try_lock().is_err() {
+        // Lost a race with another starting instance: still signal restore
+        // so the user never gets a silent no-op launch.
+        let _ = std::fs::write(dir.join("show-request"), b"show");
         launch_log("second launch blocked: already running");
         return;
     }
+    // Stale restore request from a previous crash: drop it so we don't
+    // pop open spuriously on a fresh boot.
+    let _ = std::fs::remove_file(dir.join("show-request"));
+    let _ = std::fs::remove_file(dir.join("tray-refresh-request"));
+    let _ = std::fs::remove_file(dir.join("tray-next-request"));
 
     bootstrap(&mut st);
 
@@ -302,6 +359,60 @@ fn main() {
         opts,
         Box::new(move |cc| {
             theme::install(&cc.egui_ctx);
+            // Watcher thread: restores the window on tray left-click or a
+            // second launch even when eframe stops calling `ui()` while the
+            // viewport is hidden (close-to-tray). Viewport commands are
+            // thread-safe, so this never needs `&mut app`.
+            {
+                let ctx = cc.egui_ctx.clone();
+                let _ = std::thread::Builder::new()
+                    .name("peng-watcher".into())
+                    .spawn(move || loop {
+                        let mut show = false;
+                        if platform::paths::show_request_file().exists() {
+                            let _ = std::fs::remove_file(platform::paths::show_request_file());
+                            show = true;
+                        }
+                        #[cfg(feature = "tray")]
+                        if platform::tray::try_show_requested() {
+                            show = true;
+                        }
+                        // Menu events arriving while hidden: `ui()` isn't
+                        // running to poll them, so consume here. Open restores
+                        // directly; Refresh/OpenNext need `&mut app`, so stash
+                        // a sentinel the UI thread picks up on its next frame.
+                        #[cfg(feature = "tray")]
+                        {
+                            use tray_icon::menu::MenuEvent;
+                            while let Ok(ev) = MenuEvent::receiver().try_recv() {
+                                match ev.id.0.as_str() {
+                                    platform::tray::ID_OPEN => show = true,
+                                    platform::tray::ID_SYNC => {
+                                        let _ = std::fs::write(
+                                            platform::paths::tray_refresh_file(),
+                                            b"refresh",
+                                        );
+                                    }
+                                    platform::tray::ID_NEXT => {
+                                        let _ = std::fs::write(
+                                            platform::paths::tray_next_file(),
+                                            b"next",
+                                        );
+                                    }
+                                    platform::tray::ID_QUIT => std::process::exit(0),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if show {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            ctx.request_repaint();
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    });
+            }
             Ok(Box::new(Wrap { app, hide_pending: hide_on_start, open_sync_fired: false }))
         }),
     );

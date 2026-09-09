@@ -19,6 +19,27 @@ pub mod paths {
         let _ = std::fs::create_dir_all(&d);
         d
     }
+
+    /// Sentinel file a second launch touches to ask the running instance
+    /// to restore its window (close-to-tray keeps one process alive holding
+    /// `app.lock`, so a shortcut/taskbar relaunch would otherwise exit
+    /// silently and look dead).
+    pub fn show_request_file() -> PathBuf {
+        data_dir().join("show-request")
+    }
+
+    /// Stashed tray-menu actions. The watcher thread (which works even while
+    /// the viewport is hidden) consumes `MenuEvent`s and drops one of these
+    /// so the UI thread can run the action needing `&mut app` on its next
+    /// frame. Each event is consumed exactly once — either here or by the
+    /// UI's own `try_action` poll — so nothing double-fires.
+    pub fn tray_refresh_file() -> PathBuf {
+        data_dir().join("tray-refresh-request")
+    }
+
+    pub fn tray_next_file() -> PathBuf {
+        data_dir().join("tray-next-request")
+    }
 }
 
 /// Opens a URL (or folder path) in the system browser/file manager.
@@ -324,5 +345,21 @@ pub mod tray {
             }
         }
         None
+    }
+
+    /// Left-click on the tray icon should restore the window. The context
+    /// menu is OS-handled, but clicks only arrive here — previously they
+    /// were ignored, so left-clicking a hidden app looked dead.
+    pub fn try_show_requested() -> bool {
+        use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+        let mut show = false;
+        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::Click { button, button_state, .. } = ev {
+                if button == MouseButton::Left && button_state == MouseButtonState::Up {
+                    show = true;
+                }
+            }
+        }
+        show
     }
 }
