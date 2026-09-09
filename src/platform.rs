@@ -293,7 +293,20 @@ pub mod tray {
     pub const ID_NEXT: &str = "peng-next";
     pub const ID_QUIT: &str = "peng-quit";
 
+    fn tray_log(msg: &str) {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+            .open(std::env::temp_dir().join("peng-tray.log"))
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "[{}] {}", std::process::id(), msg);
+        }
+    }
+
     /// Builds the tray on a dedicated thread and parks it there.
+    ///
+    /// The tray's hidden HWND is created on this thread, so Windows delivers
+    /// its click/menu messages to *this* thread's queue — the thread must
+    /// pump messages or the icon renders dead (visible, clicks do nothing).
     pub fn spawn_tray() {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         let _ = TOOLTIP_TX.set(Mutex::new(tx));
@@ -313,21 +326,48 @@ pub mod tray {
             }
 
             let (rgba, w, h) = super::tray_icon_img::icon_rgba();
-            let Ok(icon) = Icon::from_rgba(rgba, w, h) else { return };
-            match TrayIconBuilder::new()
+            let Ok(icon) = Icon::from_rgba(rgba, w, h) else {
+                tray_log("tray: Icon::from_rgba failed");
+                return;
+            };
+            let tray = match TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
                 .with_tooltip("RTOM — personal accountability")
                 .with_icon(icon)
                 .build()
             {
-                Ok(tray) => {
-                    // TrayIcon is !Send: the handle must stay on this thread,
-                    // so tooltip updates are served here via the channel.
-                    while let Ok(text) = rx.recv() {
-                        let _ = tray.set_tooltip(Some(text.as_str()));
+                Ok(t) => t,
+                Err(e) => {
+                    tray_log(&format!("tray: build failed: {e:?}"));
+                    return;
+                }
+            };
+            tray_log("tray: built ok");
+            // TrayIcon is !Send: the handle must stay on this thread, so
+            // tooltip updates are served here via the channel. The
+            // recv_timeout doubles as the message-pump cadence.
+            loop {
+                #[cfg(windows)]
+                unsafe {
+                    use windows_sys::Win32::UI::WindowsAndMessaging::{
+                        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+                    };
+                    let mut msg: MSG = std::mem::zeroed();
+                    while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
                     }
                 }
-                Err(_) => return,
+                match rx.recv_timeout(std::time::Duration::from_millis(16)) {
+                    Ok(text) => {
+                        let _ = tray.set_tooltip(Some(text.as_str()));
+                        while let Ok(t) = rx.try_recv() {
+                            let _ = tray.set_tooltip(Some(t.as_str()));
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
         });
     }
@@ -336,13 +376,15 @@ pub mod tray {
     pub fn try_action() -> Option<TrayAction> {
         use tray_icon::menu::MenuEvent;
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            match ev.id.0.as_str() {
-                ID_OPEN => return Some(TrayAction::Open),
-                ID_SYNC => return Some(TrayAction::Refresh),
-                ID_NEXT => return Some(TrayAction::OpenNext),
-                ID_QUIT => return Some(TrayAction::Quit),
+            let action = match ev.id.0.as_str() {
+                ID_OPEN => Some(TrayAction::Open),
+                ID_SYNC => Some(TrayAction::Refresh),
+                ID_NEXT => Some(TrayAction::OpenNext),
+                ID_QUIT => Some(TrayAction::Quit),
                 _ => continue,
-            }
+            };
+            tray_log(&format!("tray: menu event {:?}", ev.id.0));
+            return action;
         }
         None
     }
@@ -355,6 +397,7 @@ pub mod tray {
         let mut show = false;
         while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
             if let TrayIconEvent::Click { button, button_state, .. } = ev {
+                tray_log(&format!("tray: click {button:?} {button_state:?}"));
                 if button == MouseButton::Left && button_state == MouseButtonState::Up {
                     show = true;
                 }

@@ -16,6 +16,16 @@ struct Wrap {
 }
 
 impl eframe::App for Wrap {
+    /// Ticks while the window is hidden (eframe runs no egui pass then, so
+    /// `ui` never fires). An un-canceled close here would destroy the
+    /// viewport — e.g. `taskkill` without `/F` — leaving a windowless zombie.
+    /// Only the tray menu may quit the app.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // First frame rendered: tell a probing parent that this pipeline works.
