@@ -4,7 +4,7 @@
 
 use crate::model::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -62,11 +62,18 @@ pub struct Data {
     /// previous account's progress can never leak into the new one.
     #[serde(default)]
     pub solved_for: Option<String>,
+    /// Per-problem editor buffers, keyed by [`editor_key`] (`"contestId/index"`).
+    #[serde(default)]
+    pub editor_files: BTreeMap<String, EditorFile>,
+    /// Sample tests scraped from Codeforces statements, same keying.
+    /// Cached so local runs work offline after the first fetch.
+    #[serde(default)]
+    pub editor_samples: BTreeMap<String, Vec<Sample>>,
 }
 
 impl Default for Data {
     fn default() -> Self {
-        Self { version: 1, settings: Settings::default(), packs: Vec::new(), programs: Vec::new(), solved: SolvedMap::default(), submissions: Vec::new(), profile: None, rating_history: Vec::new(), last_sync: None, solved_for: None }
+        Self { version: 1, settings: Settings::default(), packs: Vec::new(), programs: Vec::new(), solved: SolvedMap::default(), submissions: Vec::new(), profile: None, rating_history: Vec::new(), last_sync: None, solved_for: None, editor_files: BTreeMap::new(), editor_samples: BTreeMap::new() }
     }
 }
 

@@ -19,7 +19,7 @@ pub fn show(app: &mut PengApp, ui: &mut egui::Ui, program_id: &str) {
         total: usize,
         views: Vec<crate::engine::MilestoneView>,
         sheets: Vec<(i64, usize, usize)>,
-        week_slice: Vec<(String, String, i64, bool, Option<i64>)>,
+        week_slice: Vec<(crate::model::ProblemKey, String, String, i64, bool, Option<i64>)>,
         week_label: String,
         week_target: usize,
         week_due: chrono::NaiveDate,
@@ -59,6 +59,7 @@ pub fn show(app: &mut PengApp, ui: &mut egui::Ui, program_id: &str) {
             for prob in &scope[lo..hi] {
                 let solved = app.store.data.solved.get(&prob.key).copied();
                 week_slice.push((
+                    prob.key.clone(),
                     prob.name.clone(),
                     prob.key.url(),
                     prob.rating,
@@ -66,7 +67,7 @@ pub fn show(app: &mut PengApp, ui: &mut egui::Ui, program_id: &str) {
                     solved.map(|i| i.ts),
                 ));
             }
-            week_slice.sort_by_key(|(_, _, _, solved, _)| (!*solved, *solved));
+            week_slice.sort_by_key(|(_, _, _, _, solved, _)| (!*solved, *solved));
         }
 
         Some(Page {
@@ -86,7 +87,7 @@ pub fn show(app: &mut PengApp, ui: &mut egui::Ui, program_id: &str) {
         })
     })();
 
-    if ui.button(RichText::new("← All programs").size(13.0).color(ACCENT2)).clicked() {
+    if ui.button(RichText::new("< All programs").size(13.0).color(ACCENT2)).clicked() {
         app.screen = super::Screen::Programs;
         return;
     }
@@ -229,7 +230,7 @@ pub fn show(app: &mut PengApp, ui: &mut egui::Ui, program_id: &str) {
                     ui.label(RichText::new("Nothing scheduled.").color(DIM));
                     return;
                 }
-                for (name, url, rating, solved, ts) in &page.week_slice {
+                for (pkey, name, url, rating, solved, ts) in &page.week_slice {
                     ui.horizontal(|ui| {
                         let dot = if *solved { GOOD } else { STROKE };
                         let (r, _) = ui
@@ -254,6 +255,13 @@ pub fn show(app: &mut PengApp, ui: &mut egui::Ui, program_id: &str) {
                             let t = engine::cf_rank(Some(*rating)).color;
                             Color32::from_rgb(t[0], t[1], t[2])
                         });
+                        if ui
+                            .small_button(RichText::new("</>").size(12.0).color(ACCENT2))
+                            .on_hover_text("Open in code editor")
+                            .clicked()
+                        {
+                            app.open_editor(pkey);
+                        }
                     });
                     ui.add_space(1.0);
                 }

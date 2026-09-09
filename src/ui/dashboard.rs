@@ -188,7 +188,7 @@ pub fn show(app: &mut PengApp, ui: &mut egui::Ui) {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let btn = egui::Button::new(
-                        RichText::new(if syncing { "  Syncing…  " } else { "⟳ Refresh Codeforces" })
+                        RichText::new(if syncing { "  Syncing…  " } else { "Refresh Codeforces" })
                             .size(14.5)
                             .color(theme::BG),
                     )
@@ -199,9 +199,14 @@ pub fn show(app: &mut PengApp, ui: &mut egui::Ui) {
                         refresh_clicked.set(true);
                     }
                     if let Some(url) = &dash.next_up_url {
-                        if ui.button(RichText::new("Next problem ↗").size(14.0)).clicked() {
+                        if ui.button(RichText::new("Next problem >").size(14.0)).clicked() {
                             let url = url.clone();
                             super::Opener::open(&url);
+                        }
+                    }
+                    if let Some(pkey) = dash.next_up_key.clone() {
+                        if ui.button(RichText::new("</> Editor").size(14.0)).clicked() {
+                            app.open_editor(&pkey);
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

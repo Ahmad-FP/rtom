@@ -3,12 +3,13 @@
 //! same code paths headlessly (no window needed).
 
 pub mod dashboard;
+pub mod editor;
 pub mod program_detail;
 pub mod problems;
 pub mod programs;
 pub mod settings;
 
-use crate::cf::{CfClient, SyncOutcome};
+use crate::cf::{AuthOutcome, CfClient, SubmitOutcome, SyncOutcome};
 use crate::engine::{self, ProgramProgress};
 use crate::model::{date_from_ce, ActiveDays, Streak};
 use crate::platform;
@@ -266,6 +267,8 @@ pub enum Screen {
     Settings,
     /// Full page for one training program (payload: program id).
     ProgramDetail(String),
+    /// Code editor for one problem (payload: `"contestId/index"`).
+    Editor(String),
 }
 
 
@@ -290,6 +293,7 @@ pub struct DashCache {
     pub secs_to_midnight: i64,
     pub next_up: Option<String>,
     pub next_up_url: Option<String>,
+    pub next_up_key: Option<crate::model::ProblemKey>,
 }
 
 pub struct PengApp {
@@ -321,12 +325,36 @@ pub struct PengApp {
     pub at_risk_toast_done: bool,
     /// Frozen user UTC offset (minutes). Resolved on first construction.
     pub utc_off: i32,
+    /// Screen to return to from the editor (set when the editor is opened).
+    pub editor_return: Screen,
+    /// Detected local toolchains, resolved once per session.
+    pub toolchains: Option<Vec<crate::runner::Toolchain>>,
+    /// Session-only Codeforces login buffers. The password lives here while
+    /// typed and is taken (dropped after one use) on login — never persisted.
+    pub login_handle_buf: String,
+    pub login_pass_buf: String,
+    /// Session-only authenticated web session. Memory-only; logout/app close
+    /// drops it. Never serialized.
+    pub cf_session: Option<crate::cf::WebSession>,
+    pub authing: bool,
+    auth_tx: Sender<AuthOutcome>,
+    auth_rx: Receiver<AuthOutcome>,
+    pub submit_state: editor::SubmitState,
+    submit_tx: Sender<SubmitOutcome>,
+    submit_rx: Receiver<SubmitOutcome>,
+    /// Last sample-run report for the open editor (`(editor_key, report)`).
+    pub ed_report: Option<(String, crate::runner::RunReport)>,
+    /// Last custom-input run for the open editor.
+    pub ed_custom: Option<crate::runner::RunReport>,
+    pub ed_custom_input: String,
     themed: bool,
 }
 
 impl PengApp {
     pub fn new(store: Store) -> Self {
         let (tx, rx) = channel();
+        let (auth_tx, auth_rx) = channel();
+        let (submit_tx, submit_rx) = channel();
         let now = Utc::now().timestamp();
         let utc_off = match store.data.settings.utc_offset_minutes {
             Some(o) => o,
@@ -359,8 +387,39 @@ impl PengApp {
             goal_detail_open: false,
             at_risk_toast_done: false,
             utc_off,
+            editor_return: Screen::Problems,
+            toolchains: None,
+            login_handle_buf: String::new(),
+            login_pass_buf: String::new(),
+            cf_session: None,
+            authing: false,
+            auth_tx,
+            auth_rx,
+            submit_state: editor::SubmitState::default(),
+            submit_tx,
+            submit_rx,
+            ed_report: None,
+            ed_custom: None,
+            ed_custom_input: String::new(),
             themed: false,
         }
+    }
+
+    /// Open the editor for `key`, remembering where to go back to.
+    /// Ensures a persisted buffer exists (prefilled with a template on first open).
+    pub fn open_editor(&mut self, key: &crate::model::ProblemKey) {
+        if !matches!(self.screen, Screen::Editor(_)) {
+            self.editor_return = self.screen.clone();
+        }
+        let k = crate::model::editor_key(key);
+        self.store.data.editor_files.entry(k).or_insert_with(|| {
+            crate::model::EditorFile { lang: crate::runner::LANG_CPP.into(), source: crate::runner::template_for(crate::runner::LANG_CPP).into() }
+        });
+        // A fresh login-password buffer every time the editor opens.
+        self.login_pass_buf.clear();
+        self.submit_state = editor::SubmitState::default();
+        self.screen = Screen::Editor(crate::model::editor_key(key));
+        self.mark_dirty();
     }
 
     /// Bench/test hook to pin time deterministically.
@@ -429,6 +488,7 @@ impl PengApp {
                     }) {
                         d.next_up = Some(format!("{} · {}", p.name, p.rating));
                         d.next_up_url = Some(p.key.url());
+                        d.next_up_key = Some(p.key.clone());
                     }
                     d.progress = Some(pr);
                 }
@@ -530,6 +590,79 @@ impl PengApp {
         }
     }
 
+    /// One-shot session login on a worker thread. The password is moved into
+    /// the thread, used for a single POST, then dropped — never persisted.
+    pub fn trigger_login(&mut self) {
+        if self.authing {
+            return;
+        }
+        let handle = self.login_handle_buf.trim().to_string();
+        let password = std::mem::take(&mut self.login_pass_buf);
+        if handle.is_empty() || password.is_empty() {
+            self.login_pass_buf = password;
+            self.toast("Enter handle/email and password", theme::WARN);
+            return;
+        }
+        self.authing = true;
+        let tx = self.auth_tx.clone();
+        std::thread::spawn(move || {
+            let out = match crate::cf::WebSession::login(&handle, &password) {
+                Ok(session) => AuthOutcome::LoggedIn { session, handle: handle.clone() },
+                Err(e) => AuthOutcome::Failed(e),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    fn poll_auth(&mut self) {
+        while let Ok(out) = self.auth_rx.try_recv() {
+            self.authing = false;
+            match out {
+                AuthOutcome::LoggedIn { session, handle } => {
+                    self.cf_session = Some(session);
+                    self.login_handle_buf = handle.clone();
+                    self.toast(format!("Logged in as {handle} (this session only)"), theme::GOOD);
+                }
+                AuthOutcome::Failed(e) => {
+                    self.toast(format!("Login failed: {e}"), theme::BAD);
+                }
+            }
+        }
+    }
+
+    fn poll_submit(&mut self) {
+        while let Ok(out) = self.submit_rx.try_recv() {
+            match out {
+                SubmitOutcome::Sent { at_ts, session } => {
+                    self.cf_session = Some(session);
+                    self.submit_state = editor::SubmitState::Sent { at_ts };
+                    self.toast("Submitted — check the verdict in a few seconds", theme::GOOD);
+                }
+                SubmitOutcome::SubmitFailed { error, session } => {
+                    // A dead session reads exactly like this; say so plainly.
+                    self.cf_session = session;
+                    self.submit_state = editor::SubmitState::Failed(error.clone());
+                    self.toast(format!("Submit failed: {error}"), theme::BAD);
+                }
+                SubmitOutcome::Verdict { text, ok } => {
+                    self.submit_state = editor::SubmitState::Verdict {
+                        text: text.clone(),
+                        ok,
+                    };
+                    if ok {
+                        // The AC is real — pull it into progress immediately.
+                        self.trigger_refresh();
+                    } else {
+                        self.toast(format!("Verdict: {text}"), theme::WARN);
+                    }
+                }
+                SubmitOutcome::VerdictFailed(e) => {
+                    self.toast(format!("Verdict check failed: {e}"), theme::BAD);
+                }
+            }
+        }
+    }
+
     fn poll_sync(&mut self) {
         while let Ok(out) = self.sync_rx.try_recv() {
             self.apply_sync_outcome(out);
@@ -560,6 +693,8 @@ impl PengApp {
             self.themed = true;
         }
         self.poll_sync();
+        self.poll_auth();
+        self.poll_submit();
         if self.dirty {
             self.rebuild_dash();
             self.dirty = false;
@@ -590,6 +725,7 @@ impl PengApp {
                         Screen::Problems => problems::show(self, ui),
                         Screen::Settings => settings::show(self, ui),
                         Screen::ProgramDetail(id) => program_detail::show(self, ui, &id),
+                        Screen::Editor(key) => editor::show(self, ui, &key),
                     });
             });
 
@@ -624,7 +760,8 @@ impl PengApp {
         ];
         for (screen, label) in items {
             let sel = self.screen == screen
-                || (matches!(self.screen, Screen::ProgramDetail(_)) && screen == Screen::Programs);
+                || (matches!(self.screen, Screen::ProgramDetail(_)) && screen == Screen::Programs)
+                || (matches!(self.screen, Screen::Editor(_)) && screen == Screen::Problems);
             if ui.selectable_label(sel, RichText::new(label).size(15.5)).clicked() {
                 self.screen = screen;
             }

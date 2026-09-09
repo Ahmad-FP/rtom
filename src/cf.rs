@@ -58,6 +58,407 @@ impl CfClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Authenticated web session (Codeforces has no submit API — this drives the
+// same HTML form a browser submits). SESSION-ONLY BY DESIGN: cookies live in
+// this struct, which lives in app memory. Nothing here is ever serialized;
+// dropping it (logout / app close) destroys the session.
+// ---------------------------------------------------------------------------
+
+const WEB: &str = "https://codeforces.com";
+const BFAA_FIXED: &str = "f1b3f18c715565b589b7823cda7448ce";
+
+/// In-memory cookie jar (ureq is built without its cookie feature).
+#[derive(Clone, Debug, Default)]
+pub struct CookieJar {
+    cookies: std::collections::BTreeMap<String, String>,
+}
+
+impl CookieJar {
+    pub fn store_values(&mut self, set_cookie: &[&str]) {
+        for raw in set_cookie {
+            let pair = raw.split(';').next().unwrap_or("").trim();
+            if let Some((k, v)) = pair.split_once('=') {
+                let k = k.trim();
+                if !k.is_empty() && !k.starts_with('$') {
+                    self.cookies.insert(k.to_string(), v.trim().to_string());
+                }
+            }
+        }
+    }
+
+    pub fn header(&self) -> String {
+        self.cookies
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cookies.is_empty()
+    }
+}
+
+/// Authenticated browser-equivalent session. Memory-only, never persisted.
+pub struct WebSession {
+    agent: ureq::Agent,
+    jar: CookieJar,
+    ftaa: String,
+    bfaa: String,
+    handle: String,
+}
+
+impl WebSession {
+    pub fn handle(&self) -> &str {
+        &self.handle
+    }
+
+    /// Unauthenticated session for public pages (sample statements).
+    /// Carries no identity; safe to construct and drop freely.
+    pub fn anonymous() -> Self {
+        let tls = std::sync::Arc::new(native_tls::TlsConnector::new().expect("tls init"));
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(25))
+            .redirects(0)
+            .tls_connector(tls)
+            .build();
+        Self {
+            agent,
+            jar: CookieJar::default(),
+            ftaa: rand_token(18),
+            bfaa: BFAA_FIXED.into(),
+            handle: String::new(),
+        }
+    }
+
+    /// Log in once. The password is used for this single POST and then
+    /// dropped with the caller's buffer — it is never stored anywhere.
+    pub fn login(handle_or_email: &str, password: &str) -> Result<Self, String> {
+        let tls = std::sync::Arc::new(native_tls::TlsConnector::new().expect("tls init"));
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(25))
+            .redirects(0)
+            .tls_connector(tls)
+            .build();
+        let mut s = Self {
+            agent,
+            jar: CookieJar::default(),
+            ftaa: rand_token(18),
+            bfaa: BFAA_FIXED.into(),
+            handle: String::new(),
+        };
+        let enter = s.get_follow(&format!("{WEB}/enter"))?;
+        let csrf = find_csrf(&enter).ok_or("login page changed (no csrf token)")?;
+        let ftaa = s.ftaa.clone();
+        let bfaa = s.bfaa.clone();
+        let body = s.post_form(
+            &format!("{WEB}/enter"),
+            &[
+                ("csrf_token", csrf.as_str()),
+                ("action", "enter"),
+                ("ftaa", ftaa.as_str()),
+                ("bfaa", bfaa.as_str()),
+                ("handleOrEmail", handle_or_email),
+                ("password", password),
+                ("_tta", "176"),
+                ("remember", "on"),
+            ],
+            Some(&csrf),
+        )?;
+        let handle = find_handle(&body).ok_or_else(|| {
+            find_cf_error(&body)
+                .map(|e| format!("login rejected: {e}"))
+                .unwrap_or_else(|| {
+                    "login failed — wrong handle/email or password (or a CAPTCHA is required; log in once in a browser, then retry)".into()
+                })
+        })?;
+        s.handle = handle.clone();
+        Ok(s)
+    }
+
+    /// Drop server-side validity hint; the real cleanup is dropping `self`.
+    pub fn handle_name(&self) -> &str {
+        &self.handle
+    }
+
+    /// Raw problem-statement HTML (public page; works with or without login,
+    /// but the session's agent is reused for TLS consistency).
+    pub fn fetch_problem_html(&mut self, contest_id: i64, index: &str) -> Result<String, String> {
+        self.get_follow(&format!("{WEB}/problemset/problem/{contest_id}/{index}"))
+    }
+
+    /// Available `(programTypeId, label)` pairs parsed live from the contest
+    /// submit page, so language IDs never go stale.
+    pub fn submit_langs(&mut self, contest_id: i64) -> Result<Vec<(String, String)>, String> {
+        let html = self.get_follow(&format!("{WEB}/contest/{contest_id}/submit"))?;
+        find_handle(&html).ok_or("session expired — log in again")?;
+        Ok(parse_lang_options(&html))
+    }
+
+    /// Submit `source` for `contest_id`/`index` as the logged-in user.
+    /// Returns when Codeforces confirms receipt (not when judged).
+    pub fn submit(
+        &mut self,
+        contest_id: i64,
+        index: &str,
+        program_type_id: &str,
+        source: &str,
+    ) -> Result<(), String> {
+        let url = format!("{WEB}/contest/{contest_id}/submit");
+        let page = self.get_follow(&url)?;
+        find_handle(&page).ok_or("session expired — log in again")?;
+        let csrf = find_csrf(&page).ok_or("submit page changed (no csrf token)")?;
+        let ftaa = self.ftaa.clone();
+        let bfaa = self.bfaa.clone();
+        let cid = contest_id.to_string();
+        let body = self.post_form(
+            &format!("{url}?csrf_token={csrf}"),
+            &[
+                ("csrf_token", csrf.as_str()),
+                ("ftaa", ftaa.as_str()),
+                ("bfaa", bfaa.as_str()),
+                ("action", "submitSolutionFormSubmitted"),
+                ("submittedProblemIndex", index),
+                ("programTypeId", program_type_id),
+                ("contestId", cid.as_str()),
+                ("source", source),
+                ("tabSize", "4"),
+                ("_tta", "594"),
+                ("sourceCodeConfirmed", "true"),
+            ],
+            Some(&csrf),
+        )?;
+        if body.contains("submitted successfully") {
+            return Ok(());
+        }
+        Err(find_cf_error(&body)
+            .map(|e| format!("submit rejected: {e}"))
+            .unwrap_or_else(|| "submit failed — Codeforces did not confirm receipt".into()))
+    }
+
+    // -- low-level plumbing --------------------------------------------------
+
+    fn capture(&mut self, resp: &ureq::Response) {
+        self.jar.store_values(&resp.all("set-cookie"));
+    }
+
+    fn apply_cookies(&self, req: ureq::Request) -> ureq::Request {
+        if self.jar.is_empty() {
+            req
+        } else {
+            req.set("Cookie", &self.jar.header())
+        }
+    }
+
+    /// GET with manual redirect following so cookies set on 302 hops are kept.
+    fn get_follow(&mut self, url: &str) -> Result<String, String> {
+        let mut url = url.to_string();
+        for _ in 0..6 {
+            let req = self.apply_cookies(
+                self.agent
+                    .get(&url)
+                    .set("User-Agent", "RTOM/1.0 (personal tool; contact via Codeforces handle)"),
+            );
+            let (status, body, location) = match req.call() {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let loc = resp.header("location").map(|s| s.to_string());
+                    self.capture(&resp);
+                    let text = resp.into_string().map_err(|e| format!("read error: {e}"))?;
+                    (status, text, loc)
+                }
+                Err(ureq::Error::Status(code, resp)) => {
+                    let loc = resp.header("location").map(|s| s.to_string());
+                    self.capture(&resp);
+                    let text = resp.into_string().unwrap_or_default();
+                    (code, text, loc)
+                }
+                Err(ureq::Error::Transport(t)) => return Err(format!("network error: {t}")),
+            };
+            if (300..400).contains(&status) {
+                if let Some(loc) = location {
+                    url = if loc.starts_with("http") { loc } else { format!("{WEB}{loc}") };
+                    continue;
+                }
+            }
+            if (200..300).contains(&status) {
+                return Ok(body);
+            }
+            return Err(format!("Codeforces returned HTTP {status}"));
+        }
+        Err("too many redirects".into())
+    }
+
+    fn post_form(
+        &mut self,
+        url: &str,
+        fields: &[(&str, &str)],
+        csrf: Option<&str>,
+    ) -> Result<String, String> {
+        let mut req = self.apply_cookies(
+            self.agent
+                .post(url)
+                .set("User-Agent", "RTOM/1.0 (personal tool; contact via Codeforces handle)")
+                .set("Referer", WEB),
+        );
+        if let Some(c) = csrf {
+            req = req.set("X-Csrf-Token", c);
+        }
+        match req.send_form(fields) {
+            Ok(resp) => {
+                let status = resp.status();
+                let loc = resp.header("location").map(|s| s.to_string());
+                self.capture(&resp);
+                let text = resp.into_string().map_err(|e| format!("read error: {e}"))?;
+                if (300..400).contains(&status) {
+                    if let Some(loc) = loc {
+                        let next = if loc.starts_with("http") { loc } else { format!("{WEB}{loc}") };
+                        return self.get_follow(&next);
+                    }
+                }
+                Ok(text)
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let loc = resp.header("location").map(|s| s.to_string());
+                self.capture(&resp);
+                let text = resp.into_string().unwrap_or_default();
+                if (300..400).contains(&code) {
+                    if let Some(loc) = loc {
+                        let next = if loc.starts_with("http") { loc } else { format!("{WEB}{loc}") };
+                        return self.get_follow(&next);
+                    }
+                }
+                Err(format!("Codeforces returned HTTP {code}"))
+            }
+            Err(ureq::Error::Transport(t)) => Err(format!("network error: {t}")),
+        }
+    }
+}
+
+fn rand_token(n: usize) -> String {
+    // No rand crate in the tree; time+pid mixed is plenty for an anti-cache token.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    (std::time::SystemTime::now(), std::process::id(), n).hash(&mut h);
+    let mut x = h.finish();
+    const ALPH: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut out = String::with_capacity(n);
+    for _ in 0..n {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        out.push(ALPH[(x >> 33) as usize % ALPH.len()] as char);
+    }
+    out
+}
+
+/// `csrf='...'` appears in the csrf-token span and inline scripts.
+pub fn find_csrf(html: &str) -> Option<String> {
+    let i = html.find("csrf='")? + 6;
+    let end = html[i..].find('\'')?;
+    Some(html[i..i + end].to_string())
+}
+
+/// `handle = "tourist"` is embedded in every page for logged-in users.
+pub fn find_handle(html: &str) -> Option<String> {
+    let i = html.find("handle = \"")? + 10;
+    let end = html[i..].find('"')?;
+    Some(html[i..i + end].to_string())
+}
+
+/// Best-effort extraction of the red error banner text.
+pub fn find_cf_error(html: &str) -> Option<String> {
+    let mut i = 0;
+    while let Some(k) = html[i..].find("error") {
+        let j = i + k;
+        // Look for `...error...">MESSAGE</span>` within a short window.
+        let window = &html[j..(j + 400).min(html.len())];
+        if let Some(gt) = window.find("\">") {
+            let rest = &window[gt + 2..];
+            if let Some(end) = rest.find("</span>") {
+                let msg = crate::runner::html_to_text(&rest[..end]);
+                let msg = msg.trim().to_string();
+                if !msg.is_empty() && msg.len() < 300 {
+                    return Some(msg);
+                }
+            }
+        }
+        i = j + 5;
+    }
+    None
+}
+
+/// `(programTypeId, label)` pairs from the submit page's language dropdown.
+pub fn parse_lang_options(html: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let sel = match html.find("programTypeId") {
+        Some(i) => i,
+        None => return out,
+    };
+    let end_sel = html[sel..].find("</select>").map(|k| sel + k).unwrap_or(html.len());
+    let mut i = sel;
+    while let Some(k) = html[i..end_sel].find("<option") {
+        let o = i + k;
+        let val = html[o..end_sel]
+            .find("value=\"")
+            .map(|v| {
+                let s = o + v + 7;
+                html[s..end_sel].find('"').map(|e| html[s..s + e].to_string())
+            })
+            .flatten();
+        let label = html[o..end_sel].find('>').map(|g| {
+            let s = o + g + 1;
+            html[s..end_sel]
+                .find("</option>")
+                .map(|e| crate::runner::html_to_text(&html[s..s + e]).trim().to_string())
+                .unwrap_or_default()
+        });
+        if let (Some(id), Some(label)) = (val, label) {
+            if !id.is_empty() && !label.is_empty() {
+                out.push((id, label));
+            }
+        }
+        i = o + 7;
+    }
+    out
+}
+
+/// Pick a `programTypeId` for an editor language from live dropdown options,
+/// falling back to long-stable IDs when parsing yields nothing usable.
+pub fn pick_program_type(lang: &str, options: &[(String, String)]) -> (String, String) {
+    let want: &[&str] = if lang == crate::runner::LANG_PY {
+        &["Python 3", "PyPy 3"]
+    } else {
+        &["GNU G++17", "G++"]
+    };
+    for w in want {
+        if let Some(o) = options.iter().find(|(_, label)| label.contains(w)) {
+            return o.clone();
+        }
+    }
+    // Fallbacks: IDs stable on Codeforces for years (54 = GNU G++17, 31 = Python 3).
+    if lang == crate::runner::LANG_PY {
+        ("31".into(), "Python 3 (fallback)".into())
+    } else {
+        ("54".into(), "GNU G++17 (fallback)".into())
+    }
+}
+
+/// Outcome of the one-shot login worker → UI thread.
+pub enum AuthOutcome {
+    LoggedIn { session: WebSession, handle: String },
+    Failed(String),
+}
+
+/// Outcome of one-shot submit/verdict workers → UI thread. The session is
+/// moved through the worker and handed back so login survives submits.
+pub enum SubmitOutcome {
+    Sent { at_ts: i64, session: WebSession },
+    SubmitFailed { error: String, session: Option<WebSession> },
+    Verdict { text: String, ok: bool },
+    VerdictFailed(String),
+}
+
 
 /// Result of one sync run, delivered from the worker thread to the UI.
 pub enum SyncOutcome {

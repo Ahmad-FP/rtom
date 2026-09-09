@@ -269,6 +269,25 @@ fn main() {
                 app.screen = peng_lib::ui::Screen::ProgramDetail(prog.id.clone());
             }
         }
+        if std::env::var("PENG_EDITOR").is_ok() {
+            // Open the first unsolved CP-31 problem in the editor.
+            let target = app
+                .store
+                .data
+                .packs
+                .iter()
+                .find(|p| p.id == "cp31")
+                .and_then(|pack| {
+                    pack.sheets
+                        .iter()
+                        .flat_map(|s| s.problems.iter())
+                        .find(|p| !app.store.data.solved.contains_key(&p.key))
+                        .map(|p| p.key.clone())
+                });
+            if let Some(key) = target {
+                app.open_editor(&key);
+            }
+        }
         if let Ok(s) = std::env::var("PENG_SCREEN") {
             app.screen = match s.as_str() {
                 "programs" => peng_lib::ui::Screen::Programs,

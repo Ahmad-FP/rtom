@@ -174,6 +174,37 @@ pub struct Streak {
 /// Set of ordinals for days with at least one AC.
 pub type ActiveDays = BTreeSet<i32>;
 
+/// One saved editor buffer, keyed by [`editor_key`] in `Data::editor_files`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct EditorFile {
+    /// `"cpp"` or `"py"`.
+    #[serde(default)]
+    pub lang: String,
+    #[serde(default)]
+    pub source: String,
+}
+
+/// One sample test scraped from a Codeforces problem statement.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Sample {
+    #[serde(default)]
+    pub input: String,
+    #[serde(default)]
+    pub expected: String,
+}
+
+/// Stable string key for per-problem editor state (`"contestId/index"`).
+/// String keys keep `state.json` human-readable without a custom serializer.
+pub fn editor_key(key: &ProblemKey) -> String {
+    format!("{}/{}", key.contest_id, key.index)
+}
+
+/// Inverse of [`editor_key`].
+pub fn parse_editor_key(s: &str) -> Option<ProblemKey> {
+    let (cid, index) = s.split_once('/')?;
+    Some(ProblemKey::new(cid.parse().ok()?, index))
+}
+
 pub struct RankTier {
     pub name: &'static str,
     pub color: [u8; 3],

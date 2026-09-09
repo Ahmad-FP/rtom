@@ -1,6 +1,7 @@
 //! Problems screen — browse sheets of every loaded pack, open problems on Codeforces.
 
 use super::{card, chip, heading, theme::*, PengApp};
+use crate::model::ProblemKey;
 use egui::{Color32, RichText};
 
 pub fn show(app: &mut PengApp, ui: &mut egui::Ui) {
@@ -22,6 +23,7 @@ pub fn show(app: &mut PengApp, ui: &mut egui::Ui) {
 
     // Rows for the active sheet: (name, key url, rating label, tags, solved?)
     struct Row {
+        key: ProblemKey,
         name: String,
         url: String,
         rating: i64,
@@ -52,6 +54,7 @@ pub fn show(app: &mut PengApp, ui: &mut egui::Ui) {
                         prob.tags.join(", ")
                     };
                     rows.push(Row {
+                        key: prob.key.clone(),
                         name: prob.name.clone(),
                         url: prob.key.url(),
                         rating: prob.rating,
@@ -184,6 +187,13 @@ pub fn show(app: &mut PengApp, ui: &mut egui::Ui) {
                     );
                     if !row.tags.is_empty() {
                         ui.label(RichText::new(&row.tags).size(11.5).color(FAINT));
+                    }
+                    if ui
+                        .small_button(RichText::new("</>").size(12.0).color(ACCENT2))
+                        .on_hover_text("Open in code editor")
+                        .clicked()
+                    {
+                        app.open_editor(&row.key);
                     }
                 });
                 ui.add_space(1.0);
